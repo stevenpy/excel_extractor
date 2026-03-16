@@ -152,12 +152,11 @@ def insert_batch(cur, table_name, headers, batch):
     params = []
 
     for row in batch:
-        start = len(params) + 1
-        placeholders = [f"${i}" for i in range(start, start + len(row))]
+        placeholders = ["%s"] * len(row)
         placeholders_groups.append(f"({', '.join(placeholders)})")
         params.extend(row)
 
-    sql = f'''
+    query = f'''
     insert into public."{table_name}" (
       source_file,
       row_number,
@@ -166,4 +165,4 @@ def insert_batch(cur, table_name, headers, batch):
     {", ".join(placeholders_groups)};
     '''
 
-    cur.execute(sql, params)
+    cur.execute(query, params)
