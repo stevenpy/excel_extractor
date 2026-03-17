@@ -7,8 +7,7 @@ import re
 import unicodedata
 from typing import Any
 
-import psycopg2
-from psycopg2.extras import execute_batch
+import psycopg
 
 
 app = FastAPI()
@@ -27,7 +26,7 @@ def check_token(x_api_token: str | None):
 def get_conn():
     if not DATABASE_URL:
         raise HTTPException(status_code=500, detail="DATABASE_URL not configured")
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    return psycopg.connect(DATABASE_URL, sslmode="require")
 
 
 def normalize_text(value: Any) -> str:
@@ -281,7 +280,7 @@ async def import_xlsx(
                     payload.append([file_name, sheet_name] + row)
 
                 if payload:
-                    execute_batch(cur, insert_sql, payload, page_size=1000)
+                    cur.executemany(insert_sql, payload)
 
     finally:
         conn.close()
