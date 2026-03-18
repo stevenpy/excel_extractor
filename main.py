@@ -225,7 +225,7 @@ async def import_xlsx(
 
     content = await file.read()
     wb = load_workbook(filename=BytesIO(content), data_only=True)
-    sheet_name, rows = choose_best_sheet(wb)
+    _sheet_name, rows = choose_best_sheet(wb)
 
     if not rows:
         raise HTTPException(status_code=400, detail="Empty workbook")
@@ -235,9 +235,7 @@ async def import_xlsx(
     if header_row_idx is not None and header_map:
         header_row = rows[header_row_idx]
         data_rows = rows[header_row_idx + 1 :]
-        original_headers = []
-        for i in range(len(header_row)):
-            original_headers.append(str(header_row[i] or "").strip())
+        original_headers = [str(header_row[i] or "").strip() for i in range(len(header_row))]
     else:
         max_cols = max(len(r) for r in rows) if rows else 0
         data_rows = rows
@@ -260,6 +258,8 @@ async def import_xlsx(
     table_name = f"import_{sql_identifier(os.path.splitext(file_name)[0])}"
 
     cleaned_rows = []
+    row_counter = 0
+
     for row in data_rows:
         values = []
         has_non_empty = False
@@ -271,7 +271,8 @@ async def import_xlsx(
             values.append(None if val is None else str(val))
 
         if has_non_empty:
-            cleaned_rows.append(values)
+            row_counter += 1
+            cleaned_rows.append((row_counter, values))
 
     libelle_source_col = find_best_libelle_column(normalized_headers)
     libelle_clean_created = False
@@ -280,7 +281,6 @@ async def import_xlsx(
     try:
         with conn:
             with conn.cursor() as cur:
-                # Extensions nécessaires pour le matching futur
                 cur.execute("create extension if not exists pg_trgm;")
                 cur.execute("create extension if not exists unaccent;")
 
@@ -291,13 +291,13 @@ async def import_xlsx(
                   id bigserial primary key,
                   imported_at timestamptz default now(),
                   source_file text,
-                  source_sheet text,
+                  row_number bigint,
                   {cols_sql}
                 );
                 '''
                 cur.execute(create_sql)
 
-                insert_cols = ["source_file", "source_sheet"] + normalized_headers
+                insert_cols = ["source_file", "row_number"] + normalized_headers
                 cols_list = ", ".join([f'"{c}"' for c in insert_cols])
                 placeholders = ", ".join(["%s"] * len(insert_cols))
 
@@ -307,13 +307,12 @@ async def import_xlsx(
                 '''
 
                 payload = []
-                for row in cleaned_rows:
-                    payload.append([file_name, sheet_name] + row)
+                for row_number, row_values in cleaned_rows:
+                    payload.append([file_name, row_number] + row_values)
 
                 if payload:
                     cur.executemany(insert_sql, payload)
 
-                # Création automatique de libelle_clean si une colonne produit plausible est trouvée
                 if libelle_source_col:
                     cur.execute(f'''
                         alter table public."{table_name}"
@@ -349,7 +348,6 @@ async def import_xlsx(
         "success": True,
         "table_name": table_name,
         "source_file": file_name,
-        "source_sheet": sheet_name,
         "rows_imported": len(cleaned_rows),
         "columns": normalized_headers,
         "libelle_source_column_detected": libelle_source_col,
@@ -429,10 +427,8 @@ async def parse_client_xlsx(
             "rows": parsed_rows,
         })
 
-    # fallback sans header exploitable
     data_rows = rows
     product_col = fallback_detect_product_col(data_rows)
-    qty_col = None
 
     for idx, row in enumerate(data_rows, start=1):
         product_value = row[product_col] if product_col is not None and product_col < len(row) else None
