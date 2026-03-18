@@ -80,6 +80,19 @@ QTY_HEADER_CANDIDATES = [
     "volume",
 ]
 
+LIBELLE_CANDIDATES = [
+    "libelle",
+    "designation",
+    "description",
+    "article",
+    "produit",
+    "product",
+    "nom_produit",
+    "item",
+    "service",
+    "prestation",
+]
+
 
 def choose_best_sheet(wb):
     best_sheet_name = wb.sheetnames[0]
@@ -187,6 +200,17 @@ def fallback_detect_product_col(data_rows: list[list[Any]]):
     return best_col
 
 
+def find_best_libelle_column(columns: list[str]) -> str | None:
+    normalized = [normalize_key(c) for c in columns]
+
+    for candidate in LIBELLE_CANDIDATES:
+        for i, col in enumerate(normalized):
+            if col == candidate:
+                return columns[i]
+
+    return None
+
+
 @app.get("/")
 def root():
     return {"status": "ok"}
@@ -249,10 +273,17 @@ async def import_xlsx(
         if has_non_empty:
             cleaned_rows.append(values)
 
+    libelle_source_col = find_best_libelle_column(normalized_headers)
+    libelle_clean_created = False
+
     conn = get_conn()
     try:
         with conn:
             with conn.cursor() as cur:
+                # Extensions nécessaires pour le matching futur
+                cur.execute("create extension if not exists pg_trgm;")
+                cur.execute("create extension if not exists unaccent;")
+
                 cols_sql = ',\n'.join([f'"{c}" text' for c in normalized_headers])
 
                 create_sql = f'''
@@ -266,9 +297,9 @@ async def import_xlsx(
                 '''
                 cur.execute(create_sql)
 
-                insert_cols = ['source_file', 'source_sheet'] + normalized_headers
-                cols_list = ', '.join([f'"{c}"' for c in insert_cols])
-                placeholders = ', '.join(['%s'] * len(insert_cols))
+                insert_cols = ["source_file", "source_sheet"] + normalized_headers
+                cols_list = ", ".join([f'"{c}"' for c in insert_cols])
+                placeholders = ", ".join(["%s"] * len(insert_cols))
 
                 insert_sql = f'''
                 insert into public."{table_name}" ({cols_list})
@@ -282,6 +313,35 @@ async def import_xlsx(
                 if payload:
                     cur.executemany(insert_sql, payload)
 
+                # Création automatique de libelle_clean si une colonne produit plausible est trouvée
+                if libelle_source_col:
+                    cur.execute(f'''
+                        alter table public."{table_name}"
+                        add column if not exists libelle_clean text;
+                    ''')
+
+                    cur.execute(f'''
+                        update public."{table_name}"
+                        set libelle_clean = trim(
+                            regexp_replace(
+                                upper(unaccent("{libelle_source_col}")),
+                                '[^A-Z0-9 ]+',
+                                ' ',
+                                'g'
+                            )
+                        )
+                        where "{libelle_source_col}" is not null;
+                    ''')
+
+                    index_name = f'idx_{table_name}_libelle_clean_trgm'
+                    cur.execute(f'''
+                        create index if not exists "{index_name}"
+                        on public."{table_name}"
+                        using gin (libelle_clean gin_trgm_ops);
+                    ''')
+
+                    libelle_clean_created = True
+
     finally:
         conn.close()
 
@@ -292,6 +352,8 @@ async def import_xlsx(
         "source_sheet": sheet_name,
         "rows_imported": len(cleaned_rows),
         "columns": normalized_headers,
+        "libelle_source_column_detected": libelle_source_col,
+        "libelle_clean_created": libelle_clean_created,
     })
 
 
