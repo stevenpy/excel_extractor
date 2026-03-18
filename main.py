@@ -61,6 +61,7 @@ PRODUCT_HEADER_CANDIDATES = [
     "product",
     "article",
     "designation",
+    "designation_produit",
     "libelle",
     "description",
     "item",
@@ -203,9 +204,22 @@ def fallback_detect_product_col(data_rows: list[list[Any]]):
 def find_best_libelle_column(columns: list[str]) -> str | None:
     normalized = [normalize_key(c) for c in columns]
 
+    # 1. match exact
     for candidate in LIBELLE_CANDIDATES:
         for i, col in enumerate(normalized):
             if col == candidate:
+                return columns[i]
+
+    # 2. match "commence par"
+    for candidate in LIBELLE_CANDIDATES:
+        for i, col in enumerate(normalized):
+            if col.startswith(candidate):
+                return columns[i]
+
+    # 3. match "contient"
+    for candidate in LIBELLE_CANDIDATES:
+        for i, col in enumerate(normalized):
+            if candidate in col:
                 return columns[i]
 
     return None
