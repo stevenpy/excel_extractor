@@ -686,19 +686,31 @@ def fetch_next_job():
                     with next_job as (
                       select id
                       from public.quote_jobs
-                      where status = 'queued'
+                      where
+                        (
+                          status = 'queued'
+                          or (
+                            status = 'processing'
+                            and visibility_deadline is not null
+                            and visibility_deadline < now()
+                          )
+                        )
+                        and attempt_count < max_attempts
                       order by created_at
                       for update skip locked
                       limit 1
                     )
                     update public.quote_jobs q
                     set status = 'processing',
-                        started_at = now(),
-                        attempt_count = attempt_count + 1,
+                        started_at = coalesce(q.started_at, now()),
+                        locked_at = now(),
+                        visibility_deadline = now() + interval '10 minutes',
+                        last_heartbeat_at = now(),
+                        attempt_count = q.attempt_count + 1,
                         error_message = null
                     from next_job
                     where q.id = next_job.id
-                    returning q.id, q.supplier_id, q.input_type, q.payload_json;
+                    returning q.id, q.supplier_id, q.input_type, q.payload_json, q.attempt_count, q.max_attempts;
                 """)
                 row = cur.fetchone()
         return row
@@ -715,7 +727,10 @@ def mark_done(job_id: int, result_payload: dict):
                     update public.quote_jobs
                     set status = 'done',
                         finished_at = now(),
-                        payload_json = %s
+                        payload_json = %s,
+                        locked_at = null,
+                        visibility_deadline = null,
+                        last_heartbeat_at = null
                     where id = %s
                 """, (json.dumps(result_payload), job_id))
     finally:
@@ -729,18 +744,44 @@ def mark_failed(job_id: int, error_message: str):
             with conn.cursor() as cur:
                 cur.execute("""
                     update public.quote_jobs
-                    set status = 'failed',
-                        finished_at = now(),
-                        error_message = %s
+                    set
+                        status = case
+                            when attempt_count >= max_attempts then 'failed'
+                            else 'queued'
+                        end,
+                        finished_at = case
+                            when attempt_count >= max_attempts then now()
+                            else null
+                        end,
+                        error_message = %s,
+                        locked_at = null,
+                        visibility_deadline = null,
+                        last_heartbeat_at = null
                     where id = %s
                 """, (error_message[:4000], job_id))
     finally:
         conn.close()
 
+def heartbeat_job(job_id: int, extend_minutes: int = 10):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    update public.quote_jobs
+                    set last_heartbeat_at = now(),
+                        visibility_deadline = now() + (%s || ' minutes')::interval
+                    where id = %s
+                      and status = 'processing'
+                """, (extend_minutes, job_id))
+    finally:
+        conn.close()
 
 def process_job(job_row):
-    job_id, supplier_id, input_type, payload_json = job_row
+    job_id, supplier_id, input_type, payload_json, attempt_count, max_attempts = job_row
     payload = payload_json or {}
+
+    heartbeat_job(job_id)
 
     if input_type == "xlsx":
         file_b64 = payload.get("file_base64")
@@ -754,6 +795,8 @@ def process_job(job_row):
     else:
         raise RuntimeError(f"Unsupported input_type: {input_type}")
 
+    heartbeat_job(job_id)
+
     recipient_email = extract_recipient_email(payload)
     if not recipient_email:
         raise RuntimeError("Unable to determine recipient email")
@@ -765,6 +808,8 @@ def process_job(job_row):
         matched_rows = match_rows(conn, catalog_table, parsed_rows)
     finally:
         conn.close()
+
+    heartbeat_job(job_id)
 
     email_result = build_email_result(matched_rows)
     subject = build_reply_subject(payload, email_result["found_count"])

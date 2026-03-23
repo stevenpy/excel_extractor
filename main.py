@@ -510,8 +510,8 @@ async def create_quote_job(
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    insert into public.quote_jobs (supplier_id, status, input_type, payload_json)
-                    values (%s, 'queued', %s, %s)
+                    insert into public.quote_jobs (supplier_id, status, input_type, payload_json, attempt_count, max_attempts)
+                    values (%s, 'queued', %s, %s, 0, 3)
                     returning id, status, created_at
                     """,
                     (supplier_id, input_type, json.dumps(payload_json))
