@@ -198,6 +198,43 @@ def fallback_detect_product_col(data_rows):
     return best_col
 
 
+def is_footer_like_label(text: str) -> bool:
+    txt = normalize_text(text)
+    if not txt:
+        return False
+
+    txt_upper = txt.upper()
+
+    footer_markers_exact = {
+        "ETABLI A",
+        "ETABLI A :",
+        "LE",
+        "LE :",
+        "CACHET ET SIGNATURE DU CANDIDAT",
+        "SIGNATURE DU CANDIDAT",
+        "CACHET DU CANDIDAT",
+    }
+
+    footer_markers_contains = [
+        "CACHET ET SIGNATURE",
+        "SIGNATURE DU CANDIDAT",
+        "ETABLI A",
+        "REMISE GENERALE",
+        "CONSENTIE SUR CATALOGUE",
+    ]
+
+    compact = re.sub(r"[^A-Z0-9: ]+", " ", txt_upper)
+    compact = re.sub(r"\s+", " ", compact).strip()
+
+    if compact in footer_markers_exact:
+        return True
+
+    if any(marker in compact for marker in footer_markers_contains):
+        return True
+
+    return False
+
+
 def parse_client_xlsx_bytes(content: bytes):
     wb = load_workbook_safe(content)
     sheet_name, rows = choose_best_sheet(wb)
@@ -222,6 +259,8 @@ def parse_client_xlsx_bytes(content: bytes):
 
             if not product_label:
                 continue
+            if is_footer_like_label(product_label):
+                break
 
             low = product_label.lower()
             if "type de fournitures" in low:
