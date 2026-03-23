@@ -650,9 +650,12 @@ def extract_recipient_email(payload: dict):
 
 def build_reply_subject(payload: dict, found_count: int):
     original = str(payload.get("email_subject") or "demande de devis").strip()
-    if original.lower().startswith("re:"):
-        return f"{original} - {found_count} article(s) retenu(s)"
-    return f"RE: {original} - {found_count} article(s) retenu(s)"
+
+    # retire un éventuel ancien préfixe RE / RE:
+    original = re.sub(r"^\s*RE\s*:\s*", "", original, flags=re.IGNORECASE)
+    original = re.sub(r"^\s*RE\s+", "", original, flags=re.IGNORECASE)
+
+    return f"RE : {original} - {found_count} article(s) retenu(s)"
 
 
 def send_email_html(to_email: str, subject: str, html_body: str):
