@@ -197,6 +197,61 @@ def fallback_detect_product_col(data_rows):
 
     return best_col
 
+def is_category_like_label(text: str) -> bool:
+    txt = normalize_text(text)
+    if not txt:
+        return True
+
+    txt_upper = txt.upper()
+
+    # Liste de mots ou expressions très fréquents dans les titres de rubriques
+    category_keywords = [
+        "QUINCAILLERIE",
+        "BATIMENT",
+        "ELECTRICITE",
+        "MATERIEL",
+        "MATERIEL D EQUIPEMENT",
+        "EQUIPEMENT",
+        "OUTILLAGE",
+        "PLOMBERIE",
+        "SANITAIRE",
+        "PEINTURE",
+        "REVETEMENT",
+        "EPI",
+        "PROTECTION",
+        "FIXATION",
+        "VISSERIE",
+        "BOULONNERIE",
+        "SERRURERIE",
+        "MENUISERIE",
+        "CHAUFFAGE",
+        "CLIMATISATION",
+        "CONSOMMABLES",
+    ]
+
+    # Si c'est une ligne très courte et 100% majuscules, forte suspicion
+    if txt == txt_upper and len(txt.split()) <= 6:
+        # si aucun chiffre, encore plus probable
+        if not re.search(r"\d", txt):
+            return True
+
+    # Si la ligne correspond exactement ou quasi exactement à une rubrique connue
+    compact = re.sub(r"[^A-Z0-9]+", " ", txt_upper).strip()
+    for kw in category_keywords:
+        if compact == kw:
+            return True
+
+    # Si la ligne est essentiellement textuelle, sans chiffres,
+    # et sans signes très typiques d’un vrai produit
+    if not re.search(r"\d", txt):
+        has_product_markers = any(marker in txt_upper for marker in [
+            "MM", "CM", "M ", " X ", "X", "Ø", "D125", "D150", "GR", "G80", "G120"
+        ])
+        if txt == txt_upper and not has_product_markers:
+            return True
+
+    return False
+
 
 def parse_client_xlsx_bytes(content: bytes):
     wb = load_workbook_safe(content)
@@ -262,6 +317,8 @@ def parse_client_xlsx_bytes(content: bytes):
         product_label = normalize_text(product_value)
 
         if not product_label:
+            continue
+        if is_category_like_label(product_label):
             continue
         if len(product_label) < 3:
             continue
@@ -356,6 +413,8 @@ def parse_email_body(body: str):
 
         product_label = normalize_text(product_label)
         if not product_label or len(product_label) < 3:
+            continue
+        if is_category_like_label(product_label):
             continue
 
         idx += 1
