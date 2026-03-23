@@ -204,8 +204,10 @@ def is_footer_like_label(text: str) -> bool:
         return False
 
     txt_upper = txt.upper()
+    compact = re.sub(r"[^A-Z0-9%: ]+", " ", txt_upper)
+    compact = re.sub(r"\s+", " ", compact).strip()
 
-    footer_markers_exact = {
+    exact_markers = {
         "ETABLI A",
         "ETABLI A :",
         "LE",
@@ -213,9 +215,12 @@ def is_footer_like_label(text: str) -> bool:
         "CACHET ET SIGNATURE DU CANDIDAT",
         "SIGNATURE DU CANDIDAT",
         "CACHET DU CANDIDAT",
+        "TAUX",
+        "COMPTANT",
+        "TOTAL",
     }
 
-    footer_markers_contains = [
+    contains_markers = [
         "CACHET ET SIGNATURE",
         "SIGNATURE DU CANDIDAT",
         "ETABLI A",
@@ -223,13 +228,65 @@ def is_footer_like_label(text: str) -> bool:
         "CONSENTIE SUR CATALOGUE",
     ]
 
-    compact = re.sub(r"[^A-Z0-9: ]+", " ", txt_upper)
-    compact = re.sub(r"\s+", " ", compact).strip()
-
-    if compact in footer_markers_exact:
+    if compact in exact_markers:
         return True
 
-    if any(marker in compact for marker in footer_markers_contains):
+    if compact.endswith("%"):
+        return True
+
+    if re.fullmatch(r"\d+(?:[.,]\d+)?\s*%", compact):
+        return True
+
+    if re.fullmatch(r"\d{2}/\d{2}/\d{2,4}", compact):
+        return True
+
+    if any(marker in compact for marker in contains_markers):
+        return True
+
+    return False
+
+
+def is_category_like_label(text: str) -> bool:
+    txt = normalize_text(text)
+    if not txt:
+        return False
+
+    txt_upper = txt.upper()
+    compact = re.sub(r"[^A-Z0-9&/ -]+", " ", txt_upper)
+    compact = re.sub(r"\s+", " ", compact).strip()
+
+    # pas de chiffre = souvent rubrique
+    has_digit = bool(re.search(r"\d", compact))
+
+    # tout en majuscules, sans chiffre, peu de mots -> forte probabilité de rubrique
+    if compact == txt_upper and not has_digit:
+        word_count = len(compact.split())
+        if 1 <= word_count <= 8:
+            return True
+
+    # listes fréquentes
+    category_keywords = [
+        "QUINCAILLERIE",
+        "BATIMENT",
+        "ELECTRICITE",
+        "MATERIEL",
+        "OUTILLAGE",
+        "EQUIPEMENT",
+        "AGRICULTURE",
+        "ELECTROPORTATIF",
+        "LEVAGE",
+        "MANUTENTION",
+        "PLOMBERIE",
+        "PEINTURE",
+        "FIXATION",
+        "VISSERIE",
+        "BOULONNERIE",
+        "SERRURERIE",
+        "MENUISERIE",
+        "CONSOMMABLES",
+    ]
+
+    if not has_digit and any(word in compact for word in category_keywords):
         return True
 
     return False
@@ -261,6 +318,8 @@ def parse_client_xlsx_bytes(content: bytes):
                 continue
             if is_footer_like_label(product_label):
                 break
+            if is_category_like_label(product_label):
+                continue
 
             low = product_label.lower()
             if "type de fournitures" in low:
