@@ -565,6 +565,26 @@ def build_email_result(items_in: list[dict]):
     found_rows_html = "".join(found_rows) + total_row
     not_found_rows_html = "".join(not_found_rows)
 
+    not_found_section = ""
+    if not_found_count > 0:
+        not_found_section = f"""
+          <h3 style="margin-top:28px;">Articles non retrouvés dans notre catalogue :</h3>
+          <table style="border-collapse:collapse;width:100%;margin-top:10px;">
+            <thead>
+              <tr style="background-color:#f5f5f5;">
+                <th style="border:1px solid #ddd;padding:10px;text-align:left;">Demande client</th>
+                <th style="border:1px solid #ddd;padding:10px;text-align:center;">Quantité</th>
+                <th style="border:1px solid #ddd;padding:10px;text-align:center;">Statut</th>
+              </tr>
+            </thead>
+            <tbody>
+              {not_found_rows_html}
+            </tbody>
+          </table>
+
+          <p style="margin-top:12px;"><strong>Nombre de lignes non retrouvées :</strong> {not_found_count}</p>
+        """
+
     html = f"""
     <div style="font-family:Arial,sans-serif;font-size:14px;color:#333;line-height:1.5;">
       <p>Bonjour,</p>
@@ -589,22 +609,13 @@ def build_email_result(items_in: list[dict]):
         </tbody>
       </table>
 
-      <p style="margin-top:12px;"><strong>Nombre de lignes retenues :</strong> {found_count}<br>
-      <strong>Total HT :</strong> {total:.2f} €</p>
+      <p style="margin-top:12px;">
+        <strong>Nombre de lignes retenues :</strong> {found_count}<br>
+        <strong>Nombre de lignes non retrouvées :</strong> {not_found_count}<br>
+        <strong>Total HT :</strong> {total:.2f} €
+      </p>
 
-      <h3 style="margin-top:28px;">Articles non retrouvés dans notre catalogue :</h3>
-      <table style="border-collapse:collapse;width:100%;margin-top:10px;">
-        <thead>
-          <tr style="background-color:#f5f5f5;">
-            <th style="border:1px solid #ddd;padding:10px;text-align:left;">Demande client</th>
-            <th style="border:1px solid #ddd;padding:10px;text-align:center;">Quantité</th>
-            <th style="border:1px solid #ddd;padding:10px;text-align:center;">Statut</th>
-          </tr>
-        </thead>
-        <tbody>
-          {not_found_rows_html}
-        </tbody>
-      </table>
+      {not_found_section}
 
       <p style="margin-top:24px;">Cordialement,</p>
     </div>
