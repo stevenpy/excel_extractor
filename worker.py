@@ -4,15 +4,34 @@ import json
 import base64
 import re
 import unicodedata
+import zipfile
+import smtplib
 from io import BytesIO
+from html import escape
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 import psycopg
+from psycopg import sql
+from psycopg.rows import dict_row
+
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
-import zipfile
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+DEFAULT_SUPPLIER_CATALOG_TABLE = os.getenv("DEFAULT_SUPPLIER_CATALOG_TABLE", "")
+SUPPLIER_CATALOG_TABLE_MAP = os.getenv("SUPPLIER_CATALOG_TABLE_MAP", "{}")
+
+MIN_SIM = float(os.getenv("MIN_SIM", "0.4"))
+STRONG_SIM = float(os.getenv("STRONG_SIM", "0.7"))
+
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
 
 
 def get_conn():
@@ -27,6 +46,12 @@ def normalize_text(value):
     text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def normalize_key(value):
+    text = normalize_text(value).lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    return text.strip("_")
 
 
 PRODUCT_HEADER_CANDIDATES = [
@@ -58,17 +83,13 @@ QTY_HEADER_CANDIDATES = [
 ]
 
 
-def normalize_key(value):
-    text = normalize_text(value).lower()
-    text = re.sub(r"[^a-z0-9]+", "_", text)
-    return text.strip("_")
-
-
 def load_workbook_safe(content: bytes):
     try:
         return load_workbook(filename=BytesIO(content), data_only=True)
     except (InvalidFileException, zipfile.BadZipFile):
         raise RuntimeError("Unsupported Excel format. The uploaded file is not a valid .xlsx file.")
+    except Exception as e:
+        raise RuntimeError(f"Unable to read Excel file: {e}")
 
 
 def choose_best_sheet(wb):
@@ -188,7 +209,7 @@ def parse_client_xlsx_bytes(content: bytes):
     parsed_rows = []
 
     if header_row_idx is not None:
-        data_rows = rows[header_row_idx + 1 :]
+        data_rows = rows[header_row_idx + 1:]
         product_col = find_column_by_candidates(header_map, PRODUCT_HEADER_CANDIDATES)
         qty_col = find_column_by_candidates(header_map, QTY_HEADER_CANDIDATES)
 
@@ -225,6 +246,7 @@ def parse_client_xlsx_bytes(content: bytes):
 
             parsed_rows.append({
                 "request_row_number": idx,
+                "request_product_label": product_label,
                 "product_label": product_label,
                 "product_label_clean": normalize_text(product_label).upper(),
                 "quantity": quantity,
@@ -246,6 +268,7 @@ def parse_client_xlsx_bytes(content: bytes):
 
         parsed_rows.append({
             "request_row_number": idx,
+            "request_product_label": product_label,
             "product_label": product_label,
             "product_label_clean": normalize_text(product_label).upper(),
             "quantity": 1,
@@ -266,6 +289,7 @@ def parse_email_body(body: str):
 
     for line in lines:
         low = line.lower()
+
         if low in {"bonjour", "bonsoir", "merci", "cordialement"}:
             continue
         if low.endswith(":"):
@@ -276,6 +300,7 @@ def parse_email_body(body: str):
         idx += 1
         out.append({
             "request_row_number": idx,
+            "request_product_label": line,
             "product_label": line,
             "product_label_clean": normalize_text(line).upper(),
             "quantity": 1,
@@ -284,13 +309,308 @@ def parse_email_body(body: str):
     return out
 
 
+def parse_supplier_table_map():
+    try:
+        value = json.loads(SUPPLIER_CATALOG_TABLE_MAP or "{}")
+        if isinstance(value, dict):
+            return value
+    except Exception:
+        pass
+    return {}
+
+
+def resolve_catalog_table(supplier_id: str | None):
+    mapping = parse_supplier_table_map()
+
+    if supplier_id and supplier_id in mapping:
+        return mapping[supplier_id]
+
+    if DEFAULT_SUPPLIER_CATALOG_TABLE:
+        return DEFAULT_SUPPLIER_CATALOG_TABLE
+
+    raise RuntimeError(
+        "No catalog table configured. Set DEFAULT_SUPPLIER_CATALOG_TABLE "
+        "or SUPPLIER_CATALOG_TABLE_MAP."
+    )
+
+
+def fetch_best_match(conn, table_name: str, request_row: dict):
+    query_text = request_row.get("product_label_clean") or ""
+    request_row_number = request_row.get("request_row_number")
+    request_product_label = (
+        request_row.get("request_product_label")
+        or request_row.get("product_label")
+        or ""
+    )
+
+    if not query_text:
+        return None
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        stmt = sql.SQL("""
+            SELECT
+              %s::int AS request_row_number,
+              %s::text AS request_product_label,
+              p.*,
+              similarity(p.libelle_clean, %s) AS similarity_score
+            FROM public.{table_name} p
+            WHERE p.libelle_clean % %s
+            ORDER BY similarity_score DESC, length(p.libelle_clean) ASC
+            LIMIT 1
+        """).format(
+            table_name=sql.Identifier(table_name)
+        )
+
+        cur.execute(
+            stmt,
+            (
+                request_row_number,
+                request_product_label,
+                query_text,
+                query_text,
+            )
+        )
+        return cur.fetchone()
+
+
+def pick_first(obj: dict, keys: list[str], fallback: str = ""):
+    for key in keys:
+        value = obj.get(key)
+        if value is not None and str(value).strip() != "":
+            return str(value).strip()
+    return fallback
+
+
+def pick_number(obj: dict, keys: list[str], fallback: float = 0.0):
+    for key in keys:
+        value = obj.get(key)
+        if value is not None and str(value).strip() != "":
+            try:
+                n = float(str(value).replace(",", ".").strip())
+                if n == n:
+                    return n
+            except Exception:
+                pass
+    return fallback
+
+
+def match_rows(conn, table_name: str, parsed_rows: list[dict]):
+    merged_rows = []
+
+    for req in parsed_rows:
+        best = fetch_best_match(conn, table_name, req)
+
+        merged = {**req}
+        if best:
+            merged.update(best)
+
+        merged_rows.append(merged)
+
+    return merged_rows
+
+
+def build_email_result(items_in: list[dict]):
+    total = 0.0
+    found_count = 0
+    not_found_count = 0
+
+    found_rows = []
+    not_found_rows = []
+
+    for j in items_in:
+        demande = pick_first(j, [
+            "request_product_label",
+            "product_label"
+        ], "")
+
+        reference = pick_first(j, [
+            "code_produit",
+            "reference_article",
+            "reference",
+            "ref_article",
+            "code_article",
+            "article",
+            "gencod",
+            "code_du_fournisseur"
+        ], "")
+
+        libelle_trouve = pick_first(j, [
+            "libelle",
+            "designation_article",
+            "designation_produit",
+            "designation",
+            "description",
+            "nom_du_catalogue_cofaq",
+            "product_label"
+        ], "")
+
+        quantity = pick_number(j, ["quantity"], 1)
+        tarif = pick_number(j, [
+            "tarif_ht",
+            "prix_ht",
+            "prix_brut",
+            "prix_net",
+            "prix_vente_indicatif_ht"
+        ], 0)
+
+        sim = pick_number(j, ["similarity_score"], 0)
+
+        has_catalog_match = reference != "" and libelle_trouve != ""
+        is_accepted = has_catalog_match and sim >= MIN_SIM
+
+        if is_accepted:
+            line_total = quantity * tarif
+            total += line_total
+            found_count += 1
+
+            statut = "À vérifier"
+            if sim >= STRONG_SIM:
+                statut = "Match fort"
+            elif sim >= MIN_SIM:
+                statut = "Match moyen"
+
+            found_rows.append(f"""
+                <tr>
+                  <td style="border:1px solid #ddd;padding:10px;">{escape(demande)}</td>
+                  <td style="border:1px solid #ddd;padding:10px;">{escape(reference)}</td>
+                  <td style="border:1px solid #ddd;padding:10px;">{escape(libelle_trouve)}</td>
+                  <td style="border:1px solid #ddd;padding:10px;text-align:center;">{int(quantity) if quantity == int(quantity) else quantity}</td>
+                  <td style="border:1px solid #ddd;padding:10px;text-align:right;white-space:nowrap;">{tarif:.2f} €</td>
+                  <td style="border:1px solid #ddd;padding:10px;text-align:right;white-space:nowrap;">{line_total:.2f} €</td>
+                  <td style="border:1px solid #ddd;padding:10px;text-align:center;">{escape(statut)}</td>
+                </tr>
+            """)
+        else:
+            not_found_count += 1
+
+            not_found_rows.append(f"""
+                <tr>
+                  <td style="border:1px solid #ddd;padding:10px;">{escape(demande)}</td>
+                  <td style="border:1px solid #ddd;padding:10px;text-align:center;">{int(quantity) if quantity == int(quantity) else quantity}</td>
+                  <td style="border:1px solid #ddd;padding:10px;text-align:center;">Non trouvé</td>
+                </tr>
+            """)
+
+    total_row = ""
+    if found_rows:
+        total_row = f"""
+            <tr style="background-color:#f5f5f5;font-weight:bold;">
+              <td colspan="5" style="border:1px solid #ddd;padding:10px;text-align:right;">Total HT</td>
+              <td style="border:1px solid #ddd;padding:10px;text-align:right;white-space:nowrap;">{total:.2f} €</td>
+              <td style="border:1px solid #ddd;padding:10px;"></td>
+            </tr>
+        """
+
+    found_rows_html = "".join(found_rows) + total_row
+    not_found_rows_html = "".join(not_found_rows)
+
+    html = f"""
+    <div style="font-family:Arial,sans-serif;font-size:14px;color:#333;line-height:1.5;">
+      <p>Bonjour,</p>
+      <p>Merci pour votre demande de devis.</p>
+      <p>Veuillez trouver ci-dessous notre retour sur les articles demandés :</p>
+
+      <h3 style="margin-top:24px;">Articles retrouvés dans notre catalogue :</h3>
+      <table style="border-collapse:collapse;width:100%;margin-top:10px;">
+        <thead>
+          <tr style="background-color:#f5f5f5;">
+            <th style="border:1px solid #ddd;padding:10px;text-align:left;">Demande client</th>
+            <th style="border:1px solid #ddd;padding:10px;text-align:left;">Référence</th>
+            <th style="border:1px solid #ddd;padding:10px;text-align:left;">Libellé trouvé</th>
+            <th style="border:1px solid #ddd;padding:10px;text-align:center;">Quantité</th>
+            <th style="border:1px solid #ddd;padding:10px;text-align:right;">Prix unitaire HT</th>
+            <th style="border:1px solid #ddd;padding:10px;text-align:right;">Total HT</th>
+            <th style="border:1px solid #ddd;padding:10px;text-align:center;">Statut</th>
+          </tr>
+        </thead>
+        <tbody>
+          {found_rows_html}
+        </tbody>
+      </table>
+
+      <p style="margin-top:12px;"><strong>Nombre de lignes retenues :</strong> {found_count}<br>
+      <strong>Total HT :</strong> {total:.2f} €</p>
+
+      <h3 style="margin-top:28px;">Articles non retrouvés dans notre catalogue :</h3>
+      <table style="border-collapse:collapse;width:100%;margin-top:10px;">
+        <thead>
+          <tr style="background-color:#f5f5f5;">
+            <th style="border:1px solid #ddd;padding:10px;text-align:left;">Demande client</th>
+            <th style="border:1px solid #ddd;padding:10px;text-align:center;">Quantité</th>
+            <th style="border:1px solid #ddd;padding:10px;text-align:center;">Statut</th>
+          </tr>
+        </thead>
+        <tbody>
+          {not_found_rows_html}
+        </tbody>
+      </table>
+
+      <p style="margin-top:24px;">Cordialement,</p>
+    </div>
+    """
+
+    return {
+        "html": html,
+        "found_count": found_count,
+        "not_found_count": not_found_count,
+        "total_ht": round(total, 2),
+    }
+
+
+def extract_recipient_email(payload: dict):
+    email_from = payload.get("email_from")
+
+    if isinstance(email_from, dict):
+        value = email_from.get("value")
+        if isinstance(value, list) and value:
+            first = value[0]
+            if isinstance(first, dict) and first.get("address"):
+                return first.get("address")
+
+        if email_from.get("address"):
+            return email_from.get("address")
+
+    if isinstance(email_from, str) and email_from.strip():
+        return email_from.strip()
+
+    return None
+
+
+def build_reply_subject(payload: dict, found_count: int):
+    original = str(payload.get("email_subject") or "demande de devis").strip()
+    if original.lower().startswith("re:"):
+        return f"{original} - {found_count} article(s) retenu(s)"
+    return f"RE: {original} - {found_count} article(s) retenu(s)"
+
+
+def send_email_html(to_email: str, subject: str, html_body: str):
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS or not SMTP_FROM:
+        raise RuntimeError("SMTP configuration is incomplete")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+
+    text_body = "Votre retour devis est disponible en version HTML."
+    msg.attach(MIMEText(text_body, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.ehlo()
+        if SMTP_USE_TLS:
+            server.starttls()
+            server.ehlo()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_FROM, [to_email], msg.as_string())
+
+
 def fetch_next_job():
     conn = get_conn()
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                cur.execute("""
                     with next_job as (
                       select id
                       from public.quote_jobs
@@ -302,14 +622,13 @@ def fetch_next_job():
                     update public.quote_jobs q
                     set status = 'processing',
                         started_at = now(),
-                        attempt_count = attempt_count + 1
+                        attempt_count = attempt_count + 1,
+                        error_message = null
                     from next_job
                     where q.id = next_job.id
                     returning q.id, q.supplier_id, q.input_type, q.payload_json;
-                    """
-                )
+                """)
                 row = cur.fetchone()
-
         return row
     finally:
         conn.close()
@@ -320,16 +639,13 @@ def mark_done(job_id: int, result_payload: dict):
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                cur.execute("""
                     update public.quote_jobs
                     set status = 'done',
                         finished_at = now(),
                         payload_json = %s
                     where id = %s
-                    """,
-                    (json.dumps(result_payload), job_id)
-                )
+                """, (json.dumps(result_payload), job_id))
     finally:
         conn.close()
 
@@ -339,56 +655,67 @@ def mark_failed(job_id: int, error_message: str):
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                cur.execute("""
                     update public.quote_jobs
                     set status = 'failed',
                         finished_at = now(),
                         error_message = %s
                     where id = %s
-                    """,
-                    (error_message[:4000], job_id)
-                )
+                """, (error_message[:4000], job_id))
     finally:
         conn.close()
 
 
 def process_job(job_row):
     job_id, supplier_id, input_type, payload_json = job_row
-
     payload = payload_json or {}
 
     if input_type == "xlsx":
         file_b64 = payload.get("file_base64")
         if not file_b64:
             raise RuntimeError("Missing file_base64 in payload_json")
-
         content = base64.b64decode(file_b64)
         parsed_rows = parse_client_xlsx_bytes(content)
-
-        result = {
-            **payload,
-            "supplier_id": supplier_id,
-            "parsed_rows": parsed_rows,
-            "rows_parsed": len(parsed_rows),
-        }
-        mark_done(job_id, result)
-        return
-
-    if input_type == "email_body":
+    elif input_type == "email_body":
         body = payload.get("email_body", "")
         parsed_rows = parse_email_body(body)
+    else:
+        raise RuntimeError(f"Unsupported input_type: {input_type}")
 
-        result = {
-            **payload,
-            "supplier_id": supplier_id,
-            "parsed_rows": parsed_rows,
-            "rows_parsed": len(parsed_rows),
-        }
-        mark_done(job_id, result)
-        return
+    recipient_email = extract_recipient_email(payload)
+    if not recipient_email:
+        raise RuntimeError("Unable to determine recipient email")
 
-    raise RuntimeError(f"Unsupported input_type: {input_type}")
+    catalog_table = resolve_catalog_table(supplier_id)
+
+    conn = get_conn()
+    try:
+        matched_rows = match_rows(conn, catalog_table, parsed_rows)
+    finally:
+        conn.close()
+
+    email_result = build_email_result(matched_rows)
+    subject = build_reply_subject(payload, email_result["found_count"])
+
+    send_email_html(
+        to_email=recipient_email,
+        subject=subject,
+        html_body=email_result["html"]
+    )
+
+    result = {
+        **payload,
+        "supplier_id": supplier_id,
+        "catalog_table": catalog_table,
+        "rows_parsed": len(parsed_rows),
+        "found_count": email_result["found_count"],
+        "not_found_count": email_result["not_found_count"],
+        "total_ht": email_result["total_ht"],
+        "reply_subject": subject,
+        "recipient_email": recipient_email,
+    }
+
+    mark_done(job_id, result)
 
 
 def main():
