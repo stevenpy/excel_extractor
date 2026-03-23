@@ -354,7 +354,7 @@ def fetch_best_match(conn, table_name: str, request_row: dict):
               p.*,
               similarity(p.libelle_clean, %s) AS similarity_score
             FROM public.{table_name} p
-            WHERE p.libelle_clean % %s
+            WHERE p.libelle_clean %% %s
             ORDER BY similarity_score DESC, length(p.libelle_clean) ASC
             LIMIT 1
         """).format(
