@@ -1,10 +1,14 @@
-from fastapi import FastAPI, File, UploadFile, Header, HTTPException
+from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Body
 from fastapi.responses import JSONResponse
 from openpyxl import load_workbook
+from openpyxl.utils.exceptions import InvalidFileException
 from io import BytesIO
 import os
 import re
 import unicodedata
+import json
+import base64
+import zipfile
 from typing import Any
 
 import psycopg
@@ -61,7 +65,6 @@ PRODUCT_HEADER_CANDIDATES = [
     "product",
     "article",
     "designation",
-    "designation_produit",
     "libelle",
     "description",
     "item",
@@ -84,6 +87,8 @@ QTY_HEADER_CANDIDATES = [
 LIBELLE_CANDIDATES = [
     "libelle",
     "designation",
+    "designation_article",
+    "designation_produit",
     "description",
     "article",
     "produit",
@@ -93,6 +98,21 @@ LIBELLE_CANDIDATES = [
     "service",
     "prestation",
 ]
+
+
+def load_workbook_safe(content: bytes):
+    try:
+        return load_workbook(filename=BytesIO(content), data_only=True)
+    except (InvalidFileException, zipfile.BadZipFile):
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported Excel format. The uploaded file is not a valid .xlsx file."
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unable to read Excel file: {str(e)}"
+        )
 
 
 def choose_best_sheet(wb):
@@ -204,25 +224,115 @@ def fallback_detect_product_col(data_rows: list[list[Any]]):
 def find_best_libelle_column(columns: list[str]) -> str | None:
     normalized = [normalize_key(c) for c in columns]
 
-    # 1. match exact
     for candidate in LIBELLE_CANDIDATES:
         for i, col in enumerate(normalized):
             if col == candidate:
                 return columns[i]
 
-    # 2. match "commence par"
     for candidate in LIBELLE_CANDIDATES:
         for i, col in enumerate(normalized):
             if col.startswith(candidate):
                 return columns[i]
 
-    # 3. match "contient"
     for candidate in LIBELLE_CANDIDATES:
         for i, col in enumerate(normalized):
             if candidate in col:
                 return columns[i]
 
     return None
+
+
+def parse_client_xlsx_bytes(content: bytes):
+    wb = load_workbook_safe(content)
+    sheet_name, rows = choose_best_sheet(wb)
+
+    if not rows:
+        raise HTTPException(status_code=400, detail="Empty workbook")
+
+    header_row_idx, header_map = detect_header_row(rows)
+    parsed_rows = []
+
+    if header_row_idx is not None:
+        data_rows = rows[header_row_idx + 1 :]
+        product_col = find_column_by_candidates(header_map, PRODUCT_HEADER_CANDIDATES)
+        qty_col = find_column_by_candidates(header_map, QTY_HEADER_CANDIDATES)
+
+        if product_col is None:
+            product_col = fallback_detect_product_col(data_rows)
+
+        for idx, row in enumerate(data_rows, start=1):
+            product_value = row[product_col] if product_col is not None and product_col < len(row) else None
+            product_label = normalize_text(product_value)
+
+            if not product_label:
+                continue
+
+            low = product_label.lower()
+            if "type de fournitures" in low:
+                continue
+            if "reference fournisseur" in low:
+                continue
+            if low == "pu":
+                continue
+            if len(product_label) < 3:
+                continue
+
+            quantity = 1
+            if qty_col is not None and qty_col < len(row):
+                raw_qty = row[qty_col]
+                txt_qty = normalize_text(raw_qty).replace(",", ".")
+                try:
+                    q = float(txt_qty)
+                    if q > 0:
+                        quantity = q
+                except Exception:
+                    quantity = 1
+
+            parsed_rows.append({
+                "request_row_number": idx,
+                "product_label": product_label,
+                "product_label_clean": normalize_text(product_label).upper(),
+                "quantity": quantity,
+            })
+
+        return {
+            "success": True,
+            "sheet_name": sheet_name,
+            "header_row_index": header_row_idx + 1,
+            "product_col_index": product_col + 1 if product_col is not None else None,
+            "qty_col_index": qty_col + 1 if qty_col is not None else None,
+            "rows_parsed": len(parsed_rows),
+            "rows": parsed_rows,
+        }
+
+    data_rows = rows
+    product_col = fallback_detect_product_col(data_rows)
+
+    for idx, row in enumerate(data_rows, start=1):
+        product_value = row[product_col] if product_col is not None and product_col < len(row) else None
+        product_label = normalize_text(product_value)
+
+        if not product_label:
+            continue
+        if len(product_label) < 3:
+            continue
+
+        parsed_rows.append({
+            "request_row_number": idx,
+            "product_label": product_label,
+            "product_label_clean": normalize_text(product_label).upper(),
+            "quantity": 1,
+        })
+
+    return {
+        "success": True,
+        "sheet_name": sheet_name,
+        "header_row_index": None,
+        "product_col_index": product_col + 1 if product_col is not None else None,
+        "qty_col_index": None,
+        "rows_parsed": len(parsed_rows),
+        "rows": parsed_rows,
+    }
 
 
 @app.get("/")
@@ -238,7 +348,7 @@ async def import_xlsx(
     check_token(x_api_token)
 
     content = await file.read()
-    wb = load_workbook(filename=BytesIO(content), data_only=True)
+    wb = load_workbook_safe(content)
     _sheet_name, rows = choose_best_sheet(wb)
 
     if not rows:
@@ -375,97 +485,84 @@ async def parse_client_xlsx(
     x_api_token: str | None = Header(default=None),
 ):
     check_token(x_api_token)
-
     content = await file.read()
-    wb = load_workbook(filename=BytesIO(content), data_only=True)
-    sheet_name, rows = choose_best_sheet(wb)
+    result = parse_client_xlsx_bytes(content)
+    return JSONResponse(result)
 
-    if not rows:
-        raise HTTPException(status_code=400, detail="Empty workbook")
 
-    header_row_idx, header_map = detect_header_row(rows)
+@app.post("/quote-jobs")
+async def create_quote_job(
+    x_api_token: str | None = Header(default=None),
+    payload: dict = Body(...)
+):
+    check_token(x_api_token)
 
-    parsed_rows = []
+    supplier_id = payload.get("supplier_id")
+    input_type = payload.get("input_type")
+    payload_json = payload.get("payload_json", {})
 
-    if header_row_idx is not None:
-        data_rows = rows[header_row_idx + 1 :]
+    if input_type not in {"xlsx", "email_body"}:
+        raise HTTPException(status_code=400, detail="input_type must be 'xlsx' or 'email_body'")
 
-        product_col = find_column_by_candidates(header_map, PRODUCT_HEADER_CANDIDATES)
-        qty_col = find_column_by_candidates(header_map, QTY_HEADER_CANDIDATES)
-
-        if product_col is None:
-            product_col = fallback_detect_product_col(data_rows)
-
-        for idx, row in enumerate(data_rows, start=1):
-            product_value = row[product_col] if product_col is not None and product_col < len(row) else None
-            product_label = normalize_text(product_value)
-
-            if not product_label:
-                continue
-
-            low = product_label.lower()
-            if "type de fournitures" in low:
-                continue
-            if "reference fournisseur" in low:
-                continue
-            if low == "pu":
-                continue
-            if len(product_label) < 3:
-                continue
-
-            quantity = 1
-            if qty_col is not None and qty_col < len(row):
-                raw_qty = row[qty_col]
-                txt_qty = normalize_text(raw_qty).replace(",", ".")
-                try:
-                    q = float(txt_qty)
-                    if q > 0:
-                        quantity = q
-                except Exception:
-                    quantity = 1
-
-            parsed_rows.append({
-                "request_row_number": idx,
-                "product_label": product_label,
-                "product_label_clean": normalize_text(product_label).upper(),
-                "quantity": quantity,
-            })
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    insert into public.quote_jobs (supplier_id, status, input_type, payload_json, attempt_count, max_attempts)
+                    values (%s, 'queued', %s, %s, 0, 3)
+                    returning id, status, created_at
+                    """,
+                    (supplier_id, input_type, json.dumps(payload_json))
+                )
+                row = cur.fetchone()
 
         return JSONResponse({
             "success": True,
-            "sheet_name": sheet_name,
-            "header_row_index": header_row_idx + 1,
-            "product_col_index": product_col + 1 if product_col is not None else None,
-            "qty_col_index": qty_col + 1 if qty_col is not None else None,
-            "rows_parsed": len(parsed_rows),
-            "rows": parsed_rows,
+            "job_id": row[0],
+            "status": row[1],
+            "created_at": row[2].isoformat() if row[2] else None,
         })
+    finally:
+        conn.close()
 
-    data_rows = rows
-    product_col = fallback_detect_product_col(data_rows)
 
-    for idx, row in enumerate(data_rows, start=1):
-        product_value = row[product_col] if product_col is not None and product_col < len(row) else None
-        product_label = normalize_text(product_value)
+@app.get("/quote-jobs/{job_id}")
+async def get_quote_job(
+    job_id: int,
+    x_api_token: str | None = Header(default=None),
+):
+    check_token(x_api_token)
 
-        if not product_label:
-            continue
-        if len(product_label) < 3:
-            continue
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select id, supplier_id, status, input_type, payload_json, attempt_count,
+                       error_message, created_at, started_at, finished_at
+                from public.quote_jobs
+                where id = %s
+                """,
+                (job_id,)
+            )
+            row = cur.fetchone()
 
-        parsed_rows.append({
-            "request_row_number": idx,
-            "product_label": product_label,
-            "product_label_clean": normalize_text(product_label).upper(),
-            "quantity": 1,
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        return JSONResponse({
+            "id": row[0],
+            "supplier_id": row[1],
+            "status": row[2],
+            "input_type": row[3],
+            "payload_json": row[4],
+            "attempt_count": row[5],
+            "error_message": row[6],
+            "created_at": row[7].isoformat() if row[7] else None,
+            "started_at": row[8].isoformat() if row[8] else None,
+            "finished_at": row[9].isoformat() if row[9] else None,
         })
-
-    return JSONResponse({
-        "success": True,
-        "sheet_name": sheet_name,
-        "header_row_index": None,
-        "product_col_index": product_col + 1 if product_col is not None else None,
-        "qty_col_index": None,
-        "rows_parsed": len(parsed_rows),
-        "rows": parsed_rows,
-    })
+    finally:
+        conn.close()
