@@ -281,29 +281,90 @@ def parse_email_body(body: str):
     def clean_line(line):
         return re.sub(r"\s+", " ", str(line or "")).strip()
 
+    def extract_quantity_and_label(line: str):
+        txt = clean_line(line)
+
+        # 48 x PRODUIT
+        m = re.match(r"^\s*(\d+(?:[.,]\d+)?)\s*[xX*]\s+(.+?)\s*$", txt)
+        if m:
+            qty = float(m.group(1).replace(",", "."))
+            label = clean_line(m.group(2))
+            return qty, label
+
+        # 48 - PRODUIT
+        m = re.match(r"^\s*(\d+(?:[.,]\d+)?)\s*[-–—]\s+(.+?)\s*$", txt)
+        if m:
+            qty = float(m.group(1).replace(",", "."))
+            label = clean_line(m.group(2))
+            return qty, label
+
+        # 48 PRODUIT
+        m = re.match(r"^\s*(\d+(?:[.,]\d+)?)\s+(.+?)\s*$", txt)
+        if m:
+            qty = float(m.group(1).replace(",", "."))
+            label = clean_line(m.group(2))
+            return qty, label
+
+        return 1, txt
+
     lines = [clean_line(x) for x in str(body or "").splitlines()]
     lines = [x for x in lines if x]
+
+    skip_exact = {
+        "bonjour",
+        "bonjour,",
+        "bonsoir",
+        "bonsoir,",
+        "merci",
+        "merci,",
+        "cordialement",
+        "cordialement,",
+        "cdt",
+        "cdlt",
+        "salutations",
+        "salutations,",
+    }
+
+    skip_contains = [
+        "je voudrais",
+        "je souhaite",
+        "merci de me chiffrer",
+        "merci de me faire parvenir",
+        "demande de devis",
+        "suite à l'appel",
+    ]
 
     out = []
     idx = 0
 
     for line in lines:
-        low = line.lower()
+        low = normalize_text(line).lower()
 
-        if low in {"bonjour", "bonsoir", "merci", "cordialement"}:
+        if low in skip_exact:
             continue
+
+        if any(expr in low for expr in skip_contains):
+            continue
+
         if low.endswith(":"):
             continue
+
         if len(line) < 3:
+            continue
+
+        quantity, product_label = extract_quantity_and_label(line)
+
+        product_label = normalize_text(product_label)
+        if not product_label or len(product_label) < 3:
             continue
 
         idx += 1
         out.append({
             "request_row_number": idx,
-            "request_product_label": line,
-            "product_label": line,
-            "product_label_clean": normalize_text(line).upper(),
-            "quantity": 1,
+            "request_product_label": product_label,
+            "product_label": product_label,
+            "product_label_clean": normalize_text(product_label).upper(),
+            "quantity": quantity,
         })
 
     return out
