@@ -298,6 +298,13 @@ def parse_email_body(body: str):
             label = clean_line(m.group(2))
             return qty, label
 
+        # PRODUIT x48 / PRODUIT X48 / PRODUIT x 48 / PRODUIT X 48
+        m = re.match(r"^\s*(.+?)\s*[xX]\s*(\d+(?:[.,]\d+)?)\s*$", txt)
+        if m:
+            label = clean_line(m.group(1))
+            qty = float(m.group(2).replace(",", "."))
+            return qty, label
+
         # 48 PRODUIT
         m = re.match(r"^\s*(\d+(?:[.,]\d+)?)\s+(.+?)\s*$", txt)
         if m:
