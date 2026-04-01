@@ -3,6 +3,9 @@ from fastapi.responses import JSONResponse
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 from io import BytesIO
+from pathlib import Path
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 import os
 import re
 import unicodedata
@@ -16,8 +19,15 @@ import psycopg
 
 app = FastAPI()
 
+BASE_DIR = Path(__file__).resolve().parent
+FRONT_DIST_DIR = BASE_DIR / "dist"
 API_TOKEN = os.getenv("IMPORT_API_TOKEN", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+if FRONT_DIST_DIR.exists():
+    assets_dir = FRONT_DIST_DIR / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
 
 def check_token(x_api_token: str | None):
@@ -335,9 +345,44 @@ def parse_client_xlsx_bytes(content: bytes):
     }
 
 
-@app.get("/")
-def root():
-    return {"status": "ok"}
+@app.get("/", include_in_schema=False)
+def homepage():
+    index_file = FRONT_DIST_DIR / "index.html"
+    if not index_file.exists():
+        raise HTTPException(status_code=404, detail="Frontend not built")
+    return FileResponse(index_file)
+
+
+@app.get("/contact.html", include_in_schema=False)
+def contact_page():
+    file_path = FRONT_DIST_DIR / "contact.html"
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Contact page not found")
+    return FileResponse(file_path)
+
+
+@app.get("/tarifs.html", include_in_schema=False)
+def tarifs_page():
+    file_path = FRONT_DIST_DIR / "tarifs.html"
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Tarifs page not found")
+    return FileResponse(file_path)
+
+
+ROOT_STATIC_FILES = [
+    "favicon.svg",
+    "logo-footer.svg",
+]
+
+for filename in ROOT_STATIC_FILES:
+    file_path = FRONT_DIST_DIR / filename
+    if file_path.exists():
+        route_path = f"/{filename}"
+
+        async def _serve_file(fp=file_path):
+            return FileResponse(fp)
+
+        app.add_api_route(route_path, _serve_file, methods=["GET"], include_in_schema=False)
 
 
 @app.post("/import-xlsx")
