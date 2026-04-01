@@ -1,0 +1,1 @@
+import{m as a}from"./nav-BMV0ZW3O.js";const e=document.getElementById("site-header");e&&a(e);const t=document.getElementById("year");t&&(t.textContent=String(new Date().getFullYear()));var n;new URLSearchParams(window.location.search).get("merci")==="1"&&((n=document.getElementById("thanks"))==null||n.classList.remove("hidden"));

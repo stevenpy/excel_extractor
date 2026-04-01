@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 230 48" fill="none" role="img" aria-labelledby="navLogoTitle">
+  <title id="navLogoTitle">DevisPilot</title>
+  <!-- Pictogramme : feuille de devis + lignes + validation -->
+  <text
+    x="0"
+    y="33"
+    font-family="DM Sans, ui-sans-serif, system-ui, sans-serif"
+    font-size="26"
+    font-weight="700"
+    letter-spacing="-0.03em"
+  >
+    <tspan fill="#121627">Devis</tspan><tspan fill="#5c45ff">Pilot</tspan>
+  </text>
+</svg>
