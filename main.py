@@ -372,6 +372,7 @@ def tarifs_page():
 ROOT_STATIC_FILES = [
     "favicon.svg",
     "logo-footer.svg",
+    "logo.svg",
 ]
 
 for filename in ROOT_STATIC_FILES:
