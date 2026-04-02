@@ -44,14 +44,11 @@
       </div>
     </div>
     <script>
-      const currentUrl = new URL(window.location.href);
-      const contactSent = currentUrl.searchParams.get("contact") === "sent";
       const successBanner = document.getElementById("contact-success-banner");
-      if (contactSent && successBanner) {
+      const contactFormSubmitted = window.sessionStorage.getItem("contactFormSubmitted") === "1";
+      if (contactFormSubmitted && successBanner) {
         successBanner.classList.remove("hidden");
-        currentUrl.searchParams.delete("contact");
-        const cleanUrl = currentUrl.pathname + currentUrl.search + currentUrl.hash;
-        window.history.replaceState({}, "", cleanUrl);
+        window.sessionStorage.removeItem("contactFormSubmitted");
       }
     </script>
 
