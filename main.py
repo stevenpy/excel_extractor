@@ -353,6 +353,14 @@ def homepage():
     return FileResponse(index_file)
 
 
+@app.get("/index.html", include_in_schema=False)
+def homepage_index():
+    index_file = FRONT_DIST_DIR / "index.html"
+    if not index_file.exists():
+        raise HTTPException(status_code=404, detail="Frontend not built")
+    return FileResponse(index_file)
+
+
 @app.get("/contact.html", include_in_schema=False)
 def contact_page():
     file_path = FRONT_DIST_DIR / "contact.html"
